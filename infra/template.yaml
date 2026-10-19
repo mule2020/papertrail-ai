@@ -29,7 +29,9 @@ Resources:
   # ---------- Storage ----------
   DocsBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ProcessInvokePermission
     Properties:
+      BucketName: !Sub "${AWS::StackName}-docs-${AWS::AccountId}-${AWS::Region}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -41,6 +43,14 @@ Resources:
             AllowedOrigins: ["http://localhost:5173"]
             AllowedHeaders: ["*"]
             MaxAge: 3000
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:Put"
+            Function: !GetAtt ProcessFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: "uploads/" }
 
   DocumentsTable:
     Type: AWS::DynamoDB::Table
@@ -164,6 +174,204 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/me"
 
+  # ---------- Upload URL Lambda ----------
+  UploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-get-upload-url"
+      RetentionInDays: 3
+
+  UploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: upload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt UploadLogGroup.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-docs-${AWS::AccountId}-${AWS::Region}/uploads/*"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt DocumentsTable.Arn
+
+  UploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-get-upload-url"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt UploadRole.Arn
+      Timeout: 10
+      Code: ../backend/get_upload_url
+      LoggingConfig:
+        LogGroup: !Ref UploadLogGroup
+      Environment:
+        Variables:
+          BUCKET: !Sub "${AWS::StackName}-docs-${AWS::AccountId}-${AWS::Region}"
+          DOCS_TABLE: !Ref DocumentsTable
+
+  UploadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt UploadFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  UploadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /upload-url"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${UploadIntegration}"
+
+  UploadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/upload-url"
+
+  # ---------- Textract processing Lambda ----------
+  ProcessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-process-doc"
+      RetentionInDays: 3
+
+  ProcessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: process
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProcessLogGroup.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-docs-${AWS::AccountId}-${AWS::Region}/uploads/*"
+              - Effect: Allow
+                Action: textract:DetectDocumentText
+                Resource: "*"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt DocumentsTable.Arn
+
+  ProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-process-doc"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt ProcessRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code: ../backend/process_doc
+      LoggingConfig:
+        LogGroup: !Ref ProcessLogGroup
+      Environment:
+        Variables:
+          DOCS_TABLE: !Ref DocumentsTable
+
+  ProcessInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-docs-${AWS::AccountId}-${AWS::Region}"
+
+  # ---------- List documents Lambda ----------
+  ListLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-list-documents"
+      RetentionInDays: 3
+
+  ListRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: list
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ListLogGroup.Arn
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt DocumentsTable.Arn
+
+  ListFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-list-documents"
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt ListRole.Arn
+      Timeout: 10
+      Code: ../backend/list_documents
+      LoggingConfig:
+        LogGroup: !Ref ListLogGroup
+      Environment:
+        Variables:
+          DOCS_TABLE: !Ref DocumentsTable
+
+  ListIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ListFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /documents"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${ListIntegration}"
+
+  ListInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ListFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/documents"
 Outputs:
   ApiUrl:
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
@@ -173,3 +381,7 @@ Outputs:
     Value: !Ref UserPoolClient
   BucketName:
     Value: !Ref DocsBucket
+  DocumentsTableName:
+    Value: !Ref DocumentsTable
+  ChunksTableName:
+    Value: !Ref ChunksTable

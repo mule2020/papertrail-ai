@@ -1,5 +1,11 @@
 node_modules/
+dist/
 .env
+.env.local
 *.pem
+*.key
 packaged.yaml
 .aws-sam/
+body.json
+test.png
+.DS_Store
